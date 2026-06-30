@@ -9,8 +9,13 @@ import os
 from datetime import datetime, time as dtime
 
 import requests
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+)
 from zoneinfo import ZoneInfo
 
 logging.basicConfig(
@@ -36,6 +41,26 @@ PRAYER_NAMES_AR = {
 
 ALADHAN_URL = "https://api.aladhan.com/v1/timingsByCity"
 QURAN_PAGE_URL = "https://api.alquran.cloud/v1/page/{page}/quran-uthmani"
+
+# قائمة المدن الجاهزة اللي تظهر كأزرار (عدّل أو زِد عليها كما تحب)
+# الصيغة: (الاسم اللي يظهر للمستخدم بالعربي، اسم المدينة بالإنجليزي، اسم الدولة بالإنجليزي)
+POPULAR_CITIES = [
+    ("الرياض", "Riyadh", "Saudi Arabia"),
+    ("جدة", "Jeddah", "Saudi Arabia"),
+    ("مكة المكرمة", "Makkah", "Saudi Arabia"),
+    ("المدينة المنورة", "Madinah", "Saudi Arabia"),
+    ("الدمام", "Dammam", "Saudi Arabia"),
+    ("دبي", "Dubai", "United Arab Emirates"),
+    ("أبوظبي", "Abu Dhabi", "United Arab Emirates"),
+    ("الدوحة", "Doha", "Qatar"),
+    ("الكويت", "Kuwait City", "Kuwait"),
+    ("المنامة", "Manama", "Bahrain"),
+    ("مسقط", "Muscat", "Oman"),
+    ("القاهرة", "Cairo", "Egypt"),
+    ("عمّان", "Amman", "Jordan"),
+    ("بيروت", "Beirut", "Lebanon"),
+    ("بغداد", "Baghdad", "Iraq"),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -183,30 +208,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "أهلاً بك في بوت القرآن 📖\n\n"
         "مع كل أذان صلاة بترسل لك 5 صفحات من القرآن تلقائياً، "
         "وبتكمل من حيث وقفت في كل مرة.\n\n"
-        "أول خطوة، حدد مدينتك:\n"
-        "/city المدينة, الدولة\n\n"
-        "مثال:\n/city Riyadh, Saudi Arabia"
+        "أول خطوة، اختر مدينتك بالأمر /city"
     )
 
 
-async def set_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.message.text.partition(" ")[2].strip()
-    if "," not in text:
-        await update.message.reply_text(
-            "الصيغة الصحيحة:\n/city المدينة, الدولة\nمثال: /city Riyadh, Saudi Arabia"
-        )
-        return
+def build_city_keyboard() -> InlineKeyboardMarkup:
+    buttons = []
+    row = []
+    for i, (label, _city, _country) in enumerate(POPULAR_CITIES):
+        row.append(InlineKeyboardButton(label, callback_data=f"city_{i}"))
+        if len(row) == 2:  # زرين بكل صف
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return InlineKeyboardMarkup(buttons)
 
-    city, country = (p.strip() for p in text.split(",", 1))
-    chat_id = str(update.effective_chat.id)
 
+async def apply_city(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: str, city: str, country: str
+) -> str:
+    """يحفظ المدينة ويجدول المهام، ويرجع نص رسالة التأكيد (أو الخطأ)."""
     try:
         result = fetch_timings(city, country)
     except Exception:  # noqa: BLE001
-        await update.message.reply_text(
-            "ما قدرت ألقى أوقات الصلاة لهذه المدينة. تأكد من كتابة الاسم بالإنجليزية وحاول مرة ثانية."
+        return (
+            "ما قدرت ألقى أوقات الصلاة لهذه المدينة. "
+            "تأكد من كتابة الاسم بالإنجليزية وحاول مرة ثانية."
         )
-        return
 
     data = load_data()
     existing = data.get(chat_id, {})
@@ -226,11 +255,48 @@ async def set_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     schedule_today_jobs(context.application, chat_id, user)
 
-    await update.message.reply_text(
+    return (
         f"تم ✅ مدينتك الآن: {city}, {country}\n"
         f"وردك بيبدأ من صفحة {user['current_page']}.\n"
         "بترسل لك 5 صفحات تلقائياً مع كل أذان."
     )
+
+
+async def set_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = update.message.text.partition(" ")[2].strip()
+    chat_id = str(update.effective_chat.id)
+
+    # لو ما كتب شي بعد الأمر، نعرض له قائمة الأزرار
+    if not text:
+        await update.message.reply_text(
+            "اختر مدينتك من القائمة:\n\n"
+            "(ما لقيت مدينتك؟ اكتب /city المدينة, الدولة يدوياً، مثال:\n"
+            "/city Riyadh, Saudi Arabia)",
+            reply_markup=build_city_keyboard(),
+        )
+        return
+
+    if "," not in text:
+        await update.message.reply_text(
+            "الصيغة الصحيحة:\n/city المدينة, الدولة\nمثال: /city Riyadh, Saudi Arabia"
+        )
+        return
+
+    city, country = (p.strip() for p in text.split(",", 1))
+    message = await apply_city(context, chat_id, city, country)
+    await update.message.reply_text(message)
+
+
+async def city_button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    index = int(query.data.split("_", 1)[1])
+    label, city, country = POPULAR_CITIES[index]
+    chat_id = str(update.effective_chat.id)
+
+    message = await apply_city(context, chat_id, city, country)
+    await query.edit_message_text(message)
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -266,6 +332,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("city", set_city))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CallbackQueryHandler(city_button_callback, pattern=r"^city_\d+$"))
 
     app.run_polling()
 

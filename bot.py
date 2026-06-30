@@ -39,8 +39,19 @@ PRAYER_NAMES_AR = {
     "Isha": "العشاء",
 }
 
+# مجلد صور صفحات المصحف. الملفات لازم تكون مسماة برقم الصفحة: 1.jpg, 2.jpg ... 604.jpg
+PAGES_DIR = "pages"
+IMAGE_EXTENSIONS = ["jpg", "jpeg", "png"]
+
 ALADHAN_URL = "https://api.aladhan.com/v1/timingsByCity"
 QURAN_PAGE_URL = "https://api.alquran.cloud/v1/page/{page}/quran-uthmani"
+QURAN_SURAH_LIST_URL = "https://api.alquran.cloud/v1/surah"
+QURAN_SURAH_URL = "https://api.alquran.cloud/v1/surah/{number}/quran-uthmani"
+
+SURAHS_PER_PAGE = 8  # عدد السور اللي تظهر بكل صفحة أزرار
+MAX_MESSAGE_CHARS = 3500  # هامش أمان قبل حد تلجرام (4096)
+
+_surah_list_cache: list[dict] | None = None  # كاش بالذاكرة لقائمة السور
 
 # قائمة المدن الجاهزة اللي تظهر كأزرار (عدّل أو زِد عليها كما تحب)
 # الصيغة: (الاسم اللي يظهر للمستخدم بالعربي، اسم المدينة بالإنجليزي، اسم الدولة بالإنجليزي)
@@ -118,6 +129,54 @@ def fetch_pages(start_page: int, count: int = PAGES_PER_PRAYER) -> list[str]:
     return messages
 
 
+def find_page_image(page_num: int) -> str | None:
+    """يدور على ملف صورة الصفحة بأي امتداد مدعوم، يرجع المسار أو None."""
+    for ext in IMAGE_EXTENSIONS:
+        path = os.path.join(PAGES_DIR, f"{page_num}.{ext}")
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def get_surah_list() -> list[dict]:
+    """يرجع قائمة السور الـ114 (يجيبها مرة وحدة ويحفظها بالذاكرة)."""
+    global _surah_list_cache
+    if _surah_list_cache is None:
+        resp = requests.get(QURAN_SURAH_LIST_URL, timeout=15)
+        resp.raise_for_status()
+        _surah_list_cache = resp.json()["data"]
+    return _surah_list_cache
+
+
+def fetch_surah_messages(number: int) -> list[str]:
+    """يرجع نص سورة كاملة، مقسّم لعدة رسائل إذا كانت طويلة."""
+    resp = requests.get(QURAN_SURAH_URL.format(number=number), timeout=15)
+    resp.raise_for_status()
+    surah = resp.json()["data"]
+
+    revelation_ar = "مكية" if surah["revelationType"] == "Meccan" else "مدنية"
+    header = (
+        f"📖 سورة {surah['name']}\n"
+        f"({surah['englishName']}) — {revelation_ar} — {surah['numberOfAyahs']} آية\n"
+    )
+
+    bismillah = ""
+    if number != 1 and number != 9:
+        bismillah = "بِسْمِ اللَّهِ الرَّحْمَٰنِ الرَّحِيمِ\n\n"
+
+    messages = []
+    current = header + "\n" + bismillah
+    for ayah in surah["ayahs"]:
+        line = f"({ayah['numberInSurah']}) {ayah['text']} "
+        if len(current) + len(line) > MAX_MESSAGE_CHARS:
+            messages.append(current.strip())
+            current = ""
+        current += line
+    if current.strip():
+        messages.append(current.strip())
+    return messages
+
+
 # ---------------------------------------------------------------------------
 # جدولة المهام
 # ---------------------------------------------------------------------------
@@ -180,18 +239,29 @@ async def send_pages_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     start_page = user.get("current_page", 1)
-    try:
-        pages = fetch_pages(start_page)
-    except Exception as e:  # noqa: BLE001
-        logger.error("فشل جلب صفحات القرآن: %s", e)
-        return
+    page_numbers = [
+        ((start_page - 1 + offset) % TOTAL_PAGES) + 1
+        for offset in range(PAGES_PER_PRAYER)
+    ]
 
     prayer_ar = PRAYER_NAMES_AR.get(prayer, prayer)
     await context.bot.send_message(
         chat_id=int(chat_id), text=f"🕌 حان وقت صلاة {prayer_ar}\nوردك اليوم:"
     )
-    for page_text in pages:
-        await context.bot.send_message(chat_id=int(chat_id), text=page_text)
+
+    for page_num in page_numbers:
+        image_path = find_page_image(page_num)
+        if image_path:
+            with open(image_path, "rb") as img:
+                await context.bot.send_photo(
+                    chat_id=int(chat_id), photo=img, caption=f"📄 صفحة {page_num}"
+                )
+        else:
+            logger.error("ما لقيت صورة الصفحة %d بمجلد %s", page_num, PAGES_DIR)
+            await context.bot.send_message(
+                chat_id=int(chat_id),
+                text=f"⚠️ صورة صفحة {page_num} غير متوفرة حالياً.",
+            )
 
     new_page = start_page + PAGES_PER_PRAYER
     if new_page > TOTAL_PAGES:
